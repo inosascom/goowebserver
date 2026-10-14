@@ -41,13 +41,27 @@ The Windows edition of GOO Web Server is distributed through the Microsoft Store
 
 ## Quick start
 
-Download the Debian package on the target Ubuntu server, then install it:
+On the target Ubuntu server, download the current public release and install it with the following copy-and-paste commands:
 
 ```bash
 sudo apt update
+sudo apt install -y curl ca-certificates
+curl -fL --retry 3 \
+  -o goo-web-server_1.0.2610.2_amd64.deb \
+  https://github.com/inosascom/goowebserver/releases/download/v1.0.2610.2/goo-web-server_1.0.2610.2_amd64.deb
 sudo apt install ./goo-web-server_1.0.2610.2_amd64.deb
 goowsctl system-check
 ```
+
+Alternatively, use `wget` when it is already installed:
+
+```bash
+wget -O goo-web-server_1.0.2610.2_amd64.deb \
+  https://github.com/inosascom/goowebserver/releases/download/v1.0.2610.2/goo-web-server_1.0.2610.2_amd64.deb
+sudo apt install ./goo-web-server_1.0.2610.2_amd64.deb
+```
+
+The package installs the `goowsctl` command and its bundled PHP extension inputs only. It does not install or reconfigure Nginx, Apache, PHP, or database services until an explicit `goowsctl install ... --apply` command is run.
 
 Review an Nginx + PHP 8.4 installation before making changes:
 
