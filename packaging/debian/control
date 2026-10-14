@@ -1,0 +1,12 @@
+Source: inosas-goows
+Section: web
+Priority: optional
+Maintainer: Inosas <support@inosas.example>
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: inosas-goows
+Architecture: amd64
+Depends: bash (>= 5), ca-certificates
+Description: GOO Web Server Ubuntu installer
+ Online, selection-driven installer and local management foundation for GOO Web Server.

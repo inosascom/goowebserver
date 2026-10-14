@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# GOO Web Server Ubuntu installer — online milestone 1.
+# This command is deliberately safe by default: only `install --apply` may mutate a host.
+set -euo pipefail
+
+readonly PRODUCT="GOO Web Server"
+readonly GOOWS_VERSION="1.0.2610.2"
+readonly MIN_UBUNTU_MAJOR=22
+readonly PHP_PPA_FINGERPRINT="B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6"
+readonly PGDG_FINGERPRINT="B97B0AFCAA1A47F044F244A07FBACCC4CF8"
+readonly MYSQL_FINGERPRINT="BCA43417C3B485DD128EC6D4B7B3B788A8D3785C"
+readonly MICROSOFT_FINGERPRINT="BC528686B50D79E339D3721CEB3E94ADBE1229CF"
+
+WEB_SERVER="nginx"
+PHP_VERSION="8.3"
+DATABASE="none"
+TLS_MODE="none"
+HTTP_PORT=80
+HTTPS_PORT=443
+DOMAIN=""
+ACME_EMAIL=""
+NON_INTERACTIVE=false
+APPLY=false
+ACCEPT_SOURCES=false
+PROFILE="host"
+SQLSRV_MODE="auto"
+ACCEPT_MICROSOFT_EULA=false
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 2; }
+note() { printf '%s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+GOO Web Server Ubuntu installer
+
+Usage:
+  goowsctl system-check
+  goowsctl plan [selection options]
+  goowsctl install --apply [selection options]
+  goowsctl license status
+
+Selection options:
+  --web-server nginx|apache       Default: nginx
+  --php 8.3|8.4|8.5              Default: 8.3
+  --database none|mysql84|postgres17
+                                  Default: none
+  --tls none|letsencrypt|self-signed
+                                  Default: none
+  --http-port NUMBER              Default: 80
+  --https-port NUMBER             Default: 443
+  --domain NAME                   Required with --tls letsencrypt
+  --acme-email ADDRESS            Required with --tls letsencrypt
+  --profile host|container        Default: host
+  --sqlsrv auto|enabled|disabled  Default: auto (enabled when matching assets exist)
+  --accept-microsoft-eula         Required to install Microsoft ODBC Driver 18 for SQLSRV
+  --non-interactive               Reject prompts; all choices come from arguments
+  --accept-source-additions       Consent to approved online APT source additions
+  --apply                         Required for install; plan alone never changes a host
+EOF
+}
+
+read_os_release() {
+  [[ -r /etc/os-release ]] || die '/etc/os-release is unavailable.'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+}
+
+validate_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( "$1" <= 65535 )) || die "Invalid TCP port: $1"; }
+
+validate_selection() {
+  [[ "$WEB_SERVER" == nginx || "$WEB_SERVER" == apache ]] || die '--web-server must be nginx or apache.'
+  [[ "$PHP_VERSION" == 8.3 || "$PHP_VERSION" == 8.4 || "$PHP_VERSION" == 8.5 ]] || die '--php must be 8.3, 8.4, or 8.5.'
+  [[ "$DATABASE" == none || "$DATABASE" == mysql84 || "$DATABASE" == postgres17 ]] || die '--database must be none, mysql84, or postgres17.'
+  [[ "$TLS_MODE" == none || "$TLS_MODE" == letsencrypt || "$TLS_MODE" == self-signed ]] || die '--tls must be none, letsencrypt, or self-signed.'
+  [[ "$PROFILE" == host || "$PROFILE" == container ]] || die '--profile must be host or container.'
+  [[ "$SQLSRV_MODE" == auto || "$SQLSRV_MODE" == enabled || "$SQLSRV_MODE" == disabled ]] || die '--sqlsrv must be auto, enabled, or disabled.'
+  validate_port "$HTTP_PORT"; validate_port "$HTTPS_PORT"
+  [[ "$HTTP_PORT" != "$HTTPS_PORT" ]] || die 'HTTP and HTTPS ports must differ.'
+  if [[ "$TLS_MODE" == letsencrypt ]]; then
+    [[ -n "$DOMAIN" && -n "$ACME_EMAIL" ]] || die 'Let’s Encrypt requires --domain and --acme-email.'
+  fi
+  if [[ "$PROFILE" == container ]]; then
+    [[ "$TLS_MODE" != letsencrypt ]] || die 'Container profile cannot request Let’s Encrypt. Terminate TLS outside the container.'
+    [[ "$DATABASE" == none ]] || die 'Container profile requires --database none for the supported scale-out path.'
+  fi
+}
+
+system_check() {
+  local issues=0
+  read_os_release
+  note "$PRODUCT $GOOWS_VERSION — system check"
+  note "Distribution: ${PRETTY_NAME:-${ID:-unknown}}"
+  note "Architecture: $(uname -m)"
+  if [[ "${ID:-}" != ubuntu ]]; then note 'FAIL: Ubuntu is required.'; issues=1; fi
+  local major="${VERSION_ID%%.*}"
+  if [[ ! "$major" =~ ^[0-9]+$ ]] || (( major < MIN_UBUNTU_MAJOR )); then note "FAIL: Ubuntu ${MIN_UBUNTU_MAJOR}.04 or newer is required."; issues=1; fi
+  if [[ "$(uname -m)" != x86_64 ]]; then note 'FAIL: amd64/x86_64 is required for the first release.'; issues=1; fi
+  command -v apt-get >/dev/null || { note 'FAIL: apt-get is unavailable.'; issues=1; }
+  command -v systemctl >/dev/null || note 'WARN: systemctl is unavailable; use --profile container only.'
+  command -v ufw >/dev/null || note 'INFO: UFW is not installed; no firewall rule would be created.'
+  [[ "$issues" == 0 ]] && note 'PASS: host is eligible for a supported online installer plan.' || return 2
+}
+
+source_requirement() {
+  case "$1" in
+    8.3|8.4|8.5) note "PHP source: approved PHP repository is required for PHP $1 on all supported Ubuntu versions; --accept-source-additions is required before installation." ;;
+  esac
+}
+
+ioncube_path() { printf 'assets/ioncube/nts/%s/ioncube_loader_lin_%s.so' "$1" "$1"; }
+sqlsrv_asset_dir() { printf '%s/sqlsrv/nts/%s' "$(asset_root)" "$PHP_VERSION"; }
+sqlsrv_driver_asset() {
+  local driver="$1" asset_dir
+  asset_dir="$(sqlsrv_asset_dir)"
+  case "$driver" in
+    sqlsrv)
+      for candidate in "$asset_dir/sqlsrv.so" "$asset_dir/SQLSRV_${PHP_VERSION}_NTS.so"; do
+        [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+      done
+      ;;
+    pdo_sqlsrv)
+      for candidate in "$asset_dir/pdo_sqlsrv.so" "$asset_dir/PDO_SQLSRV_${PHP_VERSION}_NTS.so"; do
+        [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+      done
+      ;;
+  esac
+  return 1
+}
+has_sqlsrv_assets() {
+  sqlsrv_driver_asset sqlsrv >/dev/null && sqlsrv_driver_asset pdo_sqlsrv >/dev/null && [[ -f "$(sqlsrv_asset_dir)/SHA256SUMS" ]]
+}
+sqlsrv_enabled() {
+  case "$SQLSRV_MODE" in
+    disabled) return 1 ;;
+    enabled) has_sqlsrv_assets || die "SQLSRV was explicitly enabled but matching assets are missing from $(sqlsrv_asset_dir)." ;;
+    auto) has_sqlsrv_assets ;;
+  esac
+}
+
+plan() {
+  validate_selection
+  note "$PRODUCT $GOOWS_VERSION — immutable installation plan"
+  note "Profile: $PROFILE"
+  note "Web server: $WEB_SERVER"
+  note "PHP-FPM: $PHP_VERSION"
+  note "Ioncube NTS input: $(ioncube_path "$PHP_VERSION")"
+  if sqlsrv_enabled; then note "SQLSRV: enabled from $(sqlsrv_asset_dir); Microsoft ODBC Driver 18 and EULA acceptance are required."; else note "SQLSRV: disabled (add matching assets or use --sqlsrv enabled)."; fi
+  note "Database: $DATABASE"
+  note "TLS: $TLS_MODE"
+  note "Ports: HTTP $HTTP_PORT; HTTPS $HTTPS_PORT"
+  source_requirement "$PHP_VERSION"
+  case "$WEB_SERVER" in nginx) note 'Packages: nginx, phpX.Y-fpm and selected PHP extensions.' ;; apache) note 'Packages: apache2, libapache2-mod-fcgid, phpX.Y-fpm and selected PHP extensions.' ;; esac
+  case "$DATABASE" in mysql84) note 'Packages: official MySQL 8.4 LTS APT provider plus selected server/client packages.' ;; postgres17) note 'Packages: official PGDG provider plus postgresql-17/client packages.' ;; none) note 'Database packages: none.' ;; esac
+  [[ "$WEB_SERVER" == apache ]] && note 'Apache modules: rewrite, proxy_fcgi and setenvif.' || note 'Nginx rewrite support: built into the managed server configuration.'
+  [[ "$TLS_MODE" == none ]] || note "TLS action: $TLS_MODE"
+  [[ "$PROFILE" == host ]] && note 'Host actions: create goows account, render managed config, validate configuration, optionally create UFW rules, install local management service.'
+  [[ "$PROFILE" == container ]] && note 'Container actions: render foreground web-server/PHP-FPM supervision; no systemd, UFW, ACME or database server.'
+  note 'Safety: no package, service, configuration, firewall, certificate, or license state has been changed.'
+}
+
+install() {
+  [[ "$APPLY" == true ]] || die 'Refusing to change the host. Review `plan`, then rerun with install --apply.'
+  [[ "$EUID" == 0 ]] || die 'Installation requires root or sudo.'
+  system_check
+  plan
+  [[ "$ACCEPT_SOURCES" == true ]] || die 'This selected stack requires approved APT source additions. Rerun with --accept-source-additions after reviewing the plan.'
+  if sqlsrv_enabled; then [[ "$ACCEPT_MICROSOFT_EULA" == true ]] || die 'SQLSRV requires Microsoft ODBC Driver 18. Rerun with --accept-microsoft-eula after reviewing its terms.'; fi
+  ensure_apt_prerequisites
+  add_php_source
+  case "$DATABASE" in
+    mysql84) ensure_no_database_conflict; add_mysql_source ;;
+    postgres17) ensure_no_database_conflict; add_pgdg_source ;;
+  esac
+  if sqlsrv_enabled; then add_microsoft_source; fi
+  apt-get update
+  install_selected_packages
+  create_product_layout
+  configure_php_baseline
+  install_ioncube
+  install_sqlsrv
+  configure_web_server
+  write_installation_state
+  note 'Installation completed. Review the rendered configuration before exposing a hosted site to the network.'
+}
+
+key_fingerprint() {
+  gpg --show-keys --with-colons "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print toupper($10); exit }'
+}
+
+install_key() {
+  local url="$1" expected="$2" destination="$3" temporary
+  temporary="$(mktemp)"
+  trap 'rm -f "$temporary"' RETURN
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$url" -o "$temporary"
+  [[ "$(key_fingerprint "$temporary")" == "$expected" ]] || die "Repository signing-key fingerprint mismatch for $url."
+  gpg --dearmor < "$temporary" > "$destination"
+  chmod 0644 "$destination"
+  rm -f "$temporary"; trap - RETURN
+}
+
+ensure_apt_prerequisites() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install --yes --no-install-recommends ca-certificates curl gnupg
+}
+
+add_php_source() {
+  read_os_release
+  local keyring=/usr/share/keyrings/inosas-ondrej-php.gpg
+  install_key "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${PHP_PPA_FINGERPRINT}" "$PHP_PPA_FINGERPRINT" "$keyring"
+  printf 'deb [signed-by=%s] https://ppa.launchpadcontent.net/ondrej/php/ubuntu %s main\n' "$keyring" "$VERSION_CODENAME" > /etc/apt/sources.list.d/inosas-ondrej-php.list
+}
+
+add_pgdg_source() {
+  read_os_release
+  local keyring=/usr/share/keyrings/inosas-pgdg.gpg
+  install_key 'https://www.postgresql.org/media/keys/ACCC4CF8.asc' "$PGDG_FINGERPRINT" "$keyring"
+  printf 'deb [signed-by=%s] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' "$keyring" "$VERSION_CODENAME" > /etc/apt/sources.list.d/inosas-pgdg.list
+}
+
+add_mysql_source() {
+  read_os_release
+  local keyring=/usr/share/keyrings/inosas-mysql.gpg
+  install_key 'https://repo.mysql.com/RPM-GPG-KEY-mysql-2023' "$MYSQL_FINGERPRINT" "$keyring"
+  printf 'deb [signed-by=%s] https://repo.mysql.com/apt/ubuntu/ %s mysql-8.4-lts mysql-tools\n' "$keyring" "$VERSION_CODENAME" > /etc/apt/sources.list.d/inosas-mysql.list
+}
+
+add_microsoft_source() {
+  read_os_release
+  local keyring=/usr/share/keyrings/inosas-microsoft.gpg
+  install_key 'https://packages.microsoft.com/keys/microsoft.asc' "$MICROSOFT_FINGERPRINT" "$keyring"
+  printf 'deb [arch=amd64 signed-by=%s] https://packages.microsoft.com/ubuntu/%s/prod %s main\n' "$keyring" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/inosas-microsoft.list
+}
+
+ensure_no_database_conflict() {
+  if dpkg-query --show --showformat='${db:Status-Status}' mysql-server 2>/dev/null | grep -qx installed || dpkg-query --show --showformat='${db:Status-Status}' postgresql 2>/dev/null | grep -qx installed; then
+    die 'An existing MySQL or PostgreSQL installation was detected. Database migration is not automatic.'
+  fi
+}
+
+install_selected_packages() {
+  local php="php${PHP_VERSION}"
+  local packages=("${php}-fpm" "${php}-cli" "${php}-common" "${php}-curl" "${php}-gd" "${php}-intl" "${php}-mbstring" "${php}-mysql" "${php}-pgsql" "${php}-xml" "${php}-zip" "${php}-opcache")
+  case "$WEB_SERVER" in nginx) packages+=(nginx) ;; apache) packages+=(apache2 libapache2-mod-fcgid) ;; esac
+  case "$DATABASE" in mysql84) packages+=(mysql-server mysql-client) ;; postgres17) packages+=(postgresql-17 postgresql-client-17) ;; esac
+  apt-get install --yes --no-install-recommends "${packages[@]}"
+  if sqlsrv_enabled; then ACCEPT_EULA=Y apt-get install --yes --no-install-recommends msodbcsql18 unixodbc; fi
+}
+
+create_product_layout() {
+  install -d -m 0755 /opt/inosas/goows /etc/inosas/goows /var/lib/inosas/goows /var/log/inosas/goows
+  if ! getent group goows >/dev/null; then groupadd --system goows; fi
+  if ! id -u goows >/dev/null 2>&1; then useradd --system --gid goows --home-dir /var/lib/inosas/goows --shell /usr/sbin/nologin goows; fi
+  chown goows:goows /var/lib/inosas/goows /var/log/inosas/goows
+}
+
+installer_root() { cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd; }
+asset_root() {
+  if [[ -n "${GOOWS_ASSET_ROOT:-}" ]]; then printf '%s\n' "$GOOWS_ASSET_ROOT"; return; fi
+  local development_root
+  development_root="$(installer_root)/assets"
+  [[ -d "$development_root" ]] && { printf '%s\n' "$development_root"; return; }
+  printf '%s\n' '/opt/inosas/goows/assets'
+}
+
+install_ioncube() {
+  local asset_dir loader sums extension_dir ini_file
+  asset_dir="$(asset_root)/ioncube/nts/${PHP_VERSION}"
+  loader="${asset_dir}/ioncube_loader_lin_${PHP_VERSION}.so"
+  sums="${asset_dir}/SHA256SUMS"
+  [[ -f "$loader" ]] || die "Missing Ioncube NTS loader: $loader"
+  [[ -f "$sums" ]] || die "Missing Ioncube checksum file: $sums"
+  (cd "$asset_dir" && sha256sum --check --status SHA256SUMS) || die "Ioncube checksum validation failed for PHP ${PHP_VERSION}."
+  extension_dir="$("php-config${PHP_VERSION}" --extension-dir)"
+  install -m 0644 "$loader" "${extension_dir}/ioncube_loader_lin_${PHP_VERSION}.so"
+  ini_file="/etc/php/${PHP_VERSION}/fpm/conf.d/00-ioncube.ini"
+  printf 'zend_extension=ioncube_loader_lin_%s.so\n' "$PHP_VERSION" > "$ini_file"
+  "php-fpm${PHP_VERSION}" -t
+}
+
+configure_php_baseline() {
+  local file="/etc/php/${PHP_VERSION}/mods-available/goows.ini"
+  cat > "$file" <<'EOF'
+; priority=40
+; GOO Web Server managed PHP-FPM compatibility and security baseline
+cgi.fix_pathinfo=1
+expose_php=Off
+display_errors=Off
+log_errors=On
+session.cookie_httponly=1
+session.use_strict_mode=1
+opcache.enable=1
+opcache.memory_consumption=128
+opcache.max_accelerated_files=10000
+realpath_cache_size=4096K
+realpath_cache_ttl=600
+EOF
+  phpenmod -v "$PHP_VERSION" goows
+}
+
+install_sqlsrv() {
+  sqlsrv_enabled || return 0
+  local asset_dir extension_dir sqlsrv_asset pdo_sqlsrv_asset
+  asset_dir="$(sqlsrv_asset_dir)"
+  (cd "$asset_dir" && sha256sum --check --status SHA256SUMS) || die "SQLSRV checksum validation failed for PHP ${PHP_VERSION}."
+  sqlsrv_asset="$(sqlsrv_driver_asset sqlsrv)"
+  pdo_sqlsrv_asset="$(sqlsrv_driver_asset pdo_sqlsrv)"
+  extension_dir="$("php${PHP_VERSION}" -r 'echo ini_get("extension_dir");')"
+  install -m 0644 "$sqlsrv_asset" "$extension_dir/sqlsrv.so"
+  install -m 0644 "$pdo_sqlsrv_asset" "$extension_dir/pdo_sqlsrv.so"
+  printf '; priority=20\nextension=sqlsrv.so\n' > "/etc/php/${PHP_VERSION}/mods-available/sqlsrv.ini"
+  printf '; priority=30\nextension=pdo_sqlsrv.so\n' > "/etc/php/${PHP_VERSION}/mods-available/pdo_sqlsrv.ini"
+  phpenmod -v "$PHP_VERSION" sqlsrv pdo_sqlsrv
+  "php${PHP_VERSION}" -m | grep -qx sqlsrv || die 'SQLSRV did not load into the PHP CLI runtime.'
+  "php${PHP_VERSION}" -m | grep -qx pdo_sqlsrv || die 'PDO_SQLSRV did not load into the PHP CLI runtime.'
+}
+
+configure_web_server() {
+  case "$WEB_SERVER" in
+    nginx) nginx -t; systemctl enable --now "php${PHP_VERSION}-fpm" nginx ;;
+    apache) a2enmod rewrite proxy_fcgi setenvif; a2enconf "php${PHP_VERSION}-fpm"; apache2ctl configtest; systemctl enable --now "php${PHP_VERSION}-fpm" apache2 ;;
+  esac
+}
+
+write_installation_state() {
+  local state=/var/lib/inosas/goows/installation.env temporary
+  temporary="${state}.tmp"
+  umask 077
+  {
+    printf 'PRODUCT_VERSION=%q\n' "$GOOWS_VERSION"; printf 'WEB_SERVER=%q\n' "$WEB_SERVER"; printf 'PHP_VERSION=%q\n' "$PHP_VERSION"; printf 'DATABASE=%q\n' "$DATABASE"; printf 'TLS_MODE=%q\n' "$TLS_MODE"; printf 'INSTALLED_AT=%q\n' "$(date --utc --iso-8601=seconds)"
+  } > "$temporary"
+  mv "$temporary" "$state"
+  chown goows:goows "$state"; chmod 0600 "$state"
+}
+
+license_status() {
+  note 'License provider is planned from the imported Windows contract.'
+  note 'Expected Linux state path: /var/lib/inosas/goows/license/state.json'
+  note 'Online/offline activation is not implemented in this milestone.'
+}
+
+parse_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --web-server) WEB_SERVER="${2:?missing value}"; shift 2 ;; --php) PHP_VERSION="${2:?missing value}"; shift 2 ;;
+      --database) DATABASE="${2:?missing value}"; shift 2 ;; --tls) TLS_MODE="${2:?missing value}"; shift 2 ;;
+      --http-port) HTTP_PORT="${2:?missing value}"; shift 2 ;; --https-port) HTTPS_PORT="${2:?missing value}"; shift 2 ;;
+      --domain) DOMAIN="${2:?missing value}"; shift 2 ;; --acme-email) ACME_EMAIL="${2:?missing value}"; shift 2 ;;
+      --profile) PROFILE="${2:?missing value}"; shift 2 ;; --non-interactive) NON_INTERACTIVE=true; shift ;;
+      --sqlsrv) SQLSRV_MODE="${2:?missing value}"; shift 2 ;; --accept-microsoft-eula) ACCEPT_MICROSOFT_EULA=true; shift ;;
+      --accept-source-additions) ACCEPT_SOURCES=true; shift ;; --apply) APPLY=true; shift ;;
+      --help|-h) usage; exit 0 ;; *) die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+command="${1:-help}"; shift || true
+case "$command" in
+  system-check) [[ $# == 0 ]] || die 'system-check accepts no options.'; system_check ;;
+  plan) parse_options "$@"; plan ;;
+  install) parse_options "$@"; install ;;
+  license) [[ "${1:-}" == status ]] && license_status || usage ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,9 @@
+*.deb
+*.buildinfo
+*.changes
+dist/
+build/
+var/
+AGENTS.md
+!assets/ioncube/nts/**
+assets/licensing/
